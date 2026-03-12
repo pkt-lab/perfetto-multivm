@@ -1,0 +1,33 @@
+# Clock sync precision test config
+# Use short poll intervals and sched events to measure host-guest timestamp alignment
+# Analyze: for each guest sched_switch, verify corresponding host QEMU vCPU thread is scheduled
+
+duration_ms: 10000
+trace_all_machines: true
+
+buffers: { size_kb: 262144 fill_policy: DISCARD }
+
+data_sources: {
+  config {
+    name: "linux.ftrace"
+    ftrace_config {
+      ftrace_events: "sched/sched_switch"
+      ftrace_events: "sched/sched_wakeup_new"
+      ftrace_events: "sched/sched_waking"
+      # Clock events for cross-correlation
+      ftrace_events: "power/clock_set_rate"
+      ftrace_events: "power/cpu_frequency"
+      buffer_size_kb: 8192
+    }
+  }
+}
+
+data_sources: {
+  config {
+    name: "linux.process_stats"
+    process_stats_config {
+      scan_all_processes_on_start: true
+      proc_stats_poll_ms: 200
+    }
+  }
+}

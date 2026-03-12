@@ -1,0 +1,30 @@
+# Perfetto multi-machine trace config
+# CRITICAL: trace_all_machines: true is required for remote machine (relay) producers
+# This is a Perfetto v54+ requirement. Without it, only the host machine is traced.
+
+duration_ms: 10000
+trace_all_machines: true
+
+buffers: { size_kb: 131072 fill_policy: DISCARD }
+
+data_sources: {
+  config {
+    name: "linux.ftrace"
+    ftrace_config {
+      ftrace_events: "sched/sched_switch"
+      ftrace_events: "sched/sched_wakeup"
+      ftrace_events: "power/cpu_frequency"
+      buffer_size_kb: 4096
+    }
+  }
+}
+
+data_sources: {
+  config {
+    name: "linux.process_stats"
+    process_stats_config {
+      scan_all_processes_on_start: true
+      proc_stats_poll_ms: 1000
+    }
+  }
+}
