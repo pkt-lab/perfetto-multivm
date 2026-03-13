@@ -60,7 +60,7 @@ Source: `src/tracing/service/tracing_service_impl.cc`:
 
 ## Roadmap
 
-- [ ] Clock sync precision analysis (measure host-guest timestamp offset accuracy)
+- [x] Clock sync precision analysis (mean offset +1.51ms, 100% vCPU correlation — see feat/phase1)
 - [ ] Linux + Android dual-VM test
 - [ ] Multi-hypervisor support: QNX Hypervisor, Xen, pKVM
 - [ ] Automated clock correlation script
