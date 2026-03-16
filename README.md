@@ -42,25 +42,65 @@ Source: `src/tracing/service/tracing_service_impl.cc`:
 }
 ```
 
+## Architectures
+
+### A: Standalone Guest Trace (virtio-blk)
+
+Linux ARM64 guest inside QNX Hypervisor captures its own trace and writes it
+to a virtio-blk device — no host connectivity required.
+
+```
+AMD host (x86_64)
+└── QEMU (aarch64)
+    └── QNX Hypervisor 8.0
+        └── Linux 6.1 ARM64 guest
+            ├── traced + traced_probes
+            └── /dev/vda ──► /data/linux-trace.img (on QNX HV)
+```
+
+See [`docs/linux-qvm/README.md`](docs/linux-qvm/README.md) for full setup.
+
+### B: Cross-VM Relay (vsock/TCP)
+
+Host `traced` with relay endpoint collects from guest `traced_relay` + `traced_probes`
+into a single merged `.pftrace`. Requires vsock or TCP connectivity.
+
+```
+Host traced ◄──vsock──► Guest traced_relay ◄──UNIX──► Guest traced_probes
+     │                                                        │
+  consumers                                             ftrace / procstats
+  .pftrace out                                         (guest kernel data)
+```
+
+See [`docs/vsock-relay-guide.md`](docs/vsock-relay-guide.md) for full setup.
+
 ## Contents
 
 | Path | Description |
 |---|---|
-| `docs/vsock-relay-guide.md` | Full setup guide: QEMU, host traced, guest relay |
+| `docs/linux-qvm/README.md` | Linux ARM64 QVM guest tracing (Arch A, standalone) |
+| `docs/vsock-relay-guide.md` | Cross-VM relay setup guide (Arch B) |
+| `scripts/linux-qvm/build-initrd.sh` | Build initrd with Perfetto + virtio_blk.ko |
+| `scripts/linux-qvm/guest-init.sh` | Guest init: capture trace → write to /dev/vda |
+| `scripts/linux-qvm/boot-and-capture.sh` | Boot QVM guest and extract trace (from AMD host) |
 | `scripts/start-host-traced.sh` | Start host traced with vsock relay endpoint |
 | `scripts/start-guest-relay.sh` | Start guest traced_relay + traced_probes |
-| `configs/multivm-basic.pbtxt` | Basic multi-machine trace config |
+| `configs/linux-guest-ftrace.pbtxt` | Perfetto config for Linux QVM guest (Arch A) |
+| `configs/multivm-basic.pbtxt` | Basic multi-machine trace config (Arch B) |
 | `configs/multivm-clocksync-test.pbtxt` | Clock sync precision test config |
 
 ## Tested Environments
 
-| Host | Guest | Status |
-|---|---|---|
-| Linux 6.14 (aarch64, 20 CPUs) | AGL Terrific Trout 6.6.84 (virtio-aarch64, 4 CPUs) via QEMU | ✅ |
+| Architecture | Host | Guest | Status |
+|---|---|---|---|
+| A (virtio-blk) | QNX 8.0 HV (aarch64 QEMU on x86_64) | Linux 6.1.0-42-arm64 (QVM) | ✅ 17KB trace |
+| B (vsock relay) | Linux 6.14 (aarch64, 20 CPUs) | AGL Terrific Trout 6.6.84 via QEMU | ✅ |
 
 ## Roadmap
 
-- [x] Clock sync precision analysis (mean offset +1.51ms, 100% vCPU correlation — see feat/phase1)
+- [x] Clock sync precision analysis (mean offset +1.51ms, 100% vCPU correlation)
+- [x] Linux ARM64 QVM guest with virtio-blk trace output (Arch A)
+- [ ] Architecture B: QNX HV `traced_relay` → AMD host `traced` via TCP
 - [ ] Linux + Android dual-VM test
 - [ ] Multi-hypervisor support: QNX Hypervisor, Xen, pKVM
 - [ ] Automated clock correlation script
