@@ -18,7 +18,7 @@
 set -euo pipefail
 
 # --- Configuration ---
-QNX_SDP="${QNX_SDP:-/home/amd/qnx800}"
+QNX_SDP="${QNX_SDP:-$HOME/qnx800}"
 OUTPUT_DIR="${1:-/tmp/qnx-arm-hyp-build}"
 HOST_IFS_OUT="${OUTPUT_DIR}/qnx-hyp-final.bin"
 GUEST_IFS_OUT="${OUTPUT_DIR}/qnx-guest-ifs.bin"

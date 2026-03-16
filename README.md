@@ -83,6 +83,7 @@ See [`docs/vsock-relay-guide.md`](docs/vsock-relay-guide.md) for full setup.
 | `scripts/linux-qvm/build-initrd.sh` | Build initrd with Perfetto + virtio_blk.ko |
 | `scripts/linux-qvm/guest-init.sh` | Guest init: capture trace → write to /dev/vda |
 | `scripts/linux-qvm/boot-and-capture.sh` | Boot QVM guest and extract trace (from AMD host) |
+| `scripts/build-and-boot-hyp.sh` | Automated: build + patch + boot QNX HV on QEMU |
 | `scripts/start-host-traced.sh` | Start host traced with vsock relay endpoint |
 | `scripts/start-guest-relay.sh` | Start guest traced_relay + traced_probes |
 | `configs/linux-guest-ftrace.pbtxt` | Perfetto config for Linux QVM guest (Arch A) |
@@ -95,6 +96,8 @@ See [`docs/vsock-relay-guide.md`](docs/vsock-relay-guide.md) for full setup.
 |---|---|---|---|
 | A (virtio-blk) | QNX 8.0 HV (aarch64 QEMU on x86_64) | Linux 6.1.0-42-arm64 (QVM) | ✅ 17KB trace |
 | B (vsock relay) | Linux 6.14 (aarch64, 20 CPUs) | AGL Terrific Trout 6.6.84 via QEMU | ✅ |
+| HV boot | x86_64 Linux (AMD Ryzen) | QNX 8.0 HV (aarch64 TCG) | ✅ SSH + qvm |
+| HV boot | aarch64 Linux (NVIDIA GB10) | QNX 8.0 HV (aarch64 TCG) | ✅ SSH + qvm |
 
 ## Roadmap
 

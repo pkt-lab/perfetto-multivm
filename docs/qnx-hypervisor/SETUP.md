@@ -1,218 +1,185 @@
-# QNX 8.0 Hypervisor — Step-by-Step Reproduction Guide
+# QNX 8.0 Hypervisor on QEMU — Reproduction Guide
 
-> **LICENSE WARNING**: QNX SDP 8.0 is **PROPRIETARY SOFTWARE** owned by BlackBerry QNX.
-> You **MUST** have a valid QNX license. This guide references QNX tools and packages
-> but does **NOT** include any QNX binaries, libraries, source code, or disk images.
+> **LICENSE WARNING**: QNX SDP 8.0 is **proprietary software** owned by BlackBerry QNX.
+> You **must** have a valid QNX license. This guide references QNX tools and packages
+> but does **not** include any QNX binaries, libraries, source code, or disk images.
 
 ## Prerequisites
 
-### Build Machine (AMD x86_64)
+### Build Machine (x86_64 Linux)
 
-- QNX SDP 8.0 installed (e.g., at `/home/amd/qnx800/`)
-- The following QNX SDP packages installed:
+- QNX SDP 8.0 installed (e.g., at `$HOME/qnx800/`)
+- QNX SDP packages installed:
   - `com.qnx.qnx800.target.qemuvirt` — QEMU virt BSP
   - `com.qnx.qnx800.target.hypervisor.core` — qvm binary
-  - `com.qnx.qnx800.target.hypervisor.extras` — hypervisor extras
-  - `com.qnx.qnx800.target.hypervisor.group` — hypervisor group package
-  - `com.qnx.qnx800.target.driver.virtio` — virtio drivers (devb-virtio, devc-virtio)
+  - `com.qnx.qnx800.target.hypervisor.libhyp` — hypervisor library
+  - `com.qnx.qnx800.target.driver.virtio` — virtio drivers
 
 ### Runtime Machine
 
-- Any machine with `qemu-system-aarch64` (TCG mode — no KVM needed)
-- ARM64 native host recommended but x86_64 works (slower via full TCG emulation)
-- At least 4 GB free RAM (2 GB for QEMU guest + overhead)
+- `qemu-system-aarch64` (TCG mode — no KVM needed on x86_64; KVM works on ARM64)
+- `sshpass` for scripted SSH access
+- At least 4 GB free RAM
 
 ---
 
-## Step 1: Set Up Build Environment
+## Quick Start (Automated)
 
 ```bash
-# Source the QNX SDP environment
-source /home/amd/qnx800/qnxsdp-env.sh
+# Source QNX SDP environment
+source $HOME/qnx800/qnxsdp-env.sh
 
-# Verify tools are available
-which mkqnximage   # should resolve
-which mkifs        # should resolve
+# Build + boot in one command
+./scripts/build-and-boot-hyp.sh /tmp/qnx-hyp-build
+
+# SSH in (default password: root)
+sshpass -p root ssh -p 2240 root@localhost
 ```
 
-## Step 2: Build the Hypervisor Host IFS
+## Step-by-Step
+
+### Step 1: Generate Base Image
 
 ```bash
-WORKDIR=/tmp/qnx-arm-hyp2
-mkdir -p "$WORKDIR"
+source $HOME/qnx800/qnxsdp-env.sh
+
+WORKDIR=/tmp/qnx-hyp-build
+mkdir -p "$WORKDIR" && cd "$WORKDIR"
+
+# Generate hypervisor host image
+mkqnximage --arch=aarch64le --type=qvm --qvm=yes --clean --build
+```
+
+This creates `output/build/ifs.build` and `output/build/startup.sh`.
+The generated image uses `startup-armv8_fm` — **wrong for QEMU virt**.
+
+### Step 2: Fix Build Files
+
+Two changes are needed:
+
+#### 2a. Fix startup binary in ifs.build
+
+```bash
+# Replace ARM Foundation Model startup with QEMU virt startup
+sed -i 's/startup-armv8_fm -H/startup-qemu-virt -H/' output/build/ifs.build
+```
+
+Why: `startup-armv8_fm` uses ARM Foundation Model MMIO addresses.
+`startup-qemu-virt` uses QEMU virt MMIO addresses. Both support `-H` (hypervisor/EL2 mode).
+
+#### 2b. Fix virtio device addresses in startup.sh
+
+```bash
+# Fix devb-virtio MMIO address (ARM FM → QEMU virt)
+sed -i 's/smem=0x1c0d0000,irq=41/smem=0x0a003e00,irq=79/' output/build/startup.sh
+
+# Disable devc-virtio console (uses ARM FM MMIO, causes Bus Error on QEMU virt)
+sed -i 's|^ *devc-virtio -e 0x[0-9a-f]*,[0-9]*|# devc-virtio disabled for QEMU virt|' output/build/startup.sh
+```
+
+QEMU virt virtio MMIO addresses (from device tree):
+| Device | MMIO Base | IRQ | Notes |
+|--------|-----------|-----|-------|
+| virtio-blk (1st) | `0x0a003e00` | 79 | Hypervisor root disk |
+| virtio-blk (2nd) | `0x0a003c00` | 78 | Guest disk (optional) |
+| virtio-net | auto (FDT) | auto | Handled by io-sock |
+
+### Step 3: Rebuild the IFS
+
+```bash
 cd "$WORKDIR"
-
-# Generate the hypervisor host image
-mkqnximage --arch=aarch64le --type=qemu --qvm=yes --output="$WORKDIR/hyp-host"
+mkifs output/build/ifs.build output/ifs-rebuilt.bin
 ```
 
-This generates an IFS build file and supporting files. The generated image will use `startup-armv8_fm` by default — this is **wrong** for QEMU virt and must be fixed.
-
-## Step 3: Fix the Host IFS Build File
-
-Edit the generated `ifs.build` (or equivalent build spec) with these changes:
-
-### 3a. Fix startup binary
-
-Replace:
-```
-startup-armv8_fm -H
-```
-With:
-```
-startup-qemu-virt -H
+Verify:
+```bash
+readelf -h output/ifs-rebuilt.bin | grep Entry
+# Expected: 0x80000da8
 ```
 
-The `-H` flag enables hypervisor mode (EL2).
+### Step 4: Build the Trampoline
 
-### 3b. Fix smem (shared memory) addresses
-
-The ARM Foundation Model uses different MMIO addresses than QEMU virt. Update:
-
-Replace ARM FM smem addresses with QEMU virt addresses:
-```
-# Primary virtio-blk (hypervisor host disk)
-smem=0xa003e00,irq=79
-
-# Secondary virtio-blk (guest disk — add this line)
-smem=0xa003c00,irq=78
-```
-
-### 3c. Add second virtio-blk driver
-
-Add a second `devb-virtio` entry for the guest disk:
-```
-devb-virtio blk smem=0xa003c00,irq=78
-```
-
-This allows the hypervisor host to see both:
-- `/dev/hd0` — hypervisor host root filesystem
-- `/dev/hd1` — guest IFS disk (passed through to qvm guest)
-
-### 3d. Rebuild the IFS
+The trampoline is needed because QEMU only passes DTB address (X0) for Linux ARM64 Image format,
+not for ELF. QNX IFS is ELF. See [TECHNICAL.md](TECHNICAL.md) for details.
 
 ```bash
-# Rebuild with corrected build spec
-mkifs -v ifs.build /tmp/qnx-hyp-final.bin
+python3 trampoline/build-trampoline.py --entry 0x80000da8 --dtb 0x40000000 \
+  -o /tmp/qnx-tramp-hyp.img
 ```
 
-## Step 4: Build the Guest IFS
+### Step 5: Boot with QEMU
 
 ```bash
-GUEST_DIR=/tmp/qnx-arm-guest
-mkdir -p "$GUEST_DIR"
-cd "$GUEST_DIR"
-
-# Generate the guest image — type=qvm is correct here
-mkqnximage --arch=aarch64le --type=qvm --output="$GUEST_DIR/guest"
-```
-
-The guest uses `startup-armv8_fm -H` — this is **correct** because the qvm virtual machine presents an ARM Foundation Model-like hardware interface.
-
-### 4a. Build guest IFS and disk
-
-```bash
-mkifs -v ifs.build /tmp/qnx-guest-ifs.bin
-```
-
-Create a raw disk image containing the guest IFS:
-```bash
-# Create a disk image with the guest IFS
-dd if=/dev/zero of=/tmp/qnx-guest-disk.img bs=1M count=128
-# Write guest IFS to the disk image (details depend on your partitioning scheme)
-```
-
-## Step 5: Create the ARM64 Trampoline
-
-See [TECHNICAL.md](TECHNICAL.md) for full details on why this is needed.
-
-The trampoline is a 128-byte ARM64 Image header that:
-1. Tricks QEMU into treating the file as a Linux ARM64 kernel (sets X0 = DTB address)
-2. Jumps to the actual QNX ELF entry point
-
-```bash
-# Assemble the trampoline (see scripts/build-hyp.sh for automation)
-# The trampoline binary goes to /tmp/qnx-tramp-hyp.img
-```
-
-Key parameters:
-- `text_offset` at offset 8: `0x00200000` → QEMU loads trampoline at `0x40200000`
-- QNX IFS loaded via `-device loader` at its ELF entry: `0x80000000`
-- DTB placed at `0x40000000` (QEMU virt default)
-- Trampoline code: sets X0 to DTB address, branches to QNX entry at `0x80000da8`
-
-## Step 6: Create the Hypervisor Host Disk Image
-
-```bash
-# Create a raw disk image for the hypervisor host root filesystem
-dd if=/dev/zero of=/tmp/qnx-hypF-disk.img bs=1M count=256
-
-# Format and populate with QNX filesystem containing:
-#   /data/guest.conf        — qvm guest configuration
-#   /data/qnx-guest-ifs.bin — guest IFS binary
-```
-
-## Step 7: Boot with QEMU
-
-```bash
-# Use the provided boot script:
-./scripts/boot-qnx-hyp.sh
-
-# Or run manually:
 qemu-system-aarch64 \
   -machine virt-4.2,virtualization=on,gic-version=3 \
   -cpu cortex-a57 -smp 2 -m 2G \
   -kernel /tmp/qnx-tramp-hyp.img \
-  -device loader,file=/tmp/qnx-hyp-final.bin \
-  -drive file=/tmp/qnx-hypF-disk.img,format=raw,if=none,id=drv0 \
+  -device loader,file=$WORKDIR/output/ifs-rebuilt.bin \
+  -drive file=$WORKDIR/output/disk-qvm,format=raw,if=none,id=drv0,snapshot=on \
   -device virtio-blk-device,drive=drv0 \
-  -drive file=/tmp/qnx-guest-disk.img,format=raw,if=none,id=drv1 \
-  -device virtio-blk-device,drive=drv1 \
   -device virtio-net-device,netdev=net0 \
-  -netdev user,id=net0,hostfwd=tcp::2238-:22 \
+  -netdev user,id=net0,hostfwd=tcp::2240-:22 \
   -object rng-random,filename=/dev/urandom,id=rng0 \
   -device virtio-rng-device,rng=rng0 \
-  -serial file:/tmp/qnx-hypF.log -display none \
-  -monitor unix:/tmp/qemu-hypF.sock,server,nowait
+  -serial file:/tmp/qnx-hyp.log \
+  -display none -daemonize
 ```
 
-## Step 8: Verify Hypervisor Host Boot
+Notes:
+- `snapshot=on` protects the original disk image from writes
+- Remove `snapshot=on` if you need persistent changes (e.g., writing guest files to /data/)
+- Port 2240 is forwarded to guest SSH (port 22)
+
+### Step 6: Verify
 
 ```bash
-# Watch the serial log
-tail -f /tmp/qnx-hypF.log
+# Check serial log
+cat /tmp/qnx-hyp.log
+# Should show: "Startup complete" and "QNX ... QEMU_virt aarch64le"
 
-# SSH into the hypervisor host
-ssh -p 2238 root@localhost
+# SSH in
+sshpass -p root ssh -p 2240 -o StrictHostKeyChecking=no root@localhost
 
-# Verify hypervisor is running
-pidin | grep qvm
-ls /dev/hd0 /dev/hd1   # both disks visible
+# Inside QNX:
+uname -a           # QNX noname 8.0.0 ... QEMU_virt aarch64le
+pidin info         # FreeMem: ~1800MB, 2x Cortex-A57
+ls /system/bin/qvm # Hypervisor binary present
 ```
 
-## Step 9: Start the Guest VM
+---
 
-On the hypervisor host (via SSH):
+## Expected Serial Output
 
-```bash
-# Copy guest config if not already on disk
-# (should be at /data/guest.conf from the disk image)
-
-# Start the guest
-qvm @/data/guest.conf &
-
-# Watch guest console output
-cat /data/guest-console.log
+```
+** CPU 0 PE is not awake
+** CPU 1 PE is not awake
+---> Starting slogger2
+---> Starting PCI Services
+---> Starting fsevmgr
+---> Starting devb
+---> Mounting file systems
+Path=0 - target=0 lun=0  Direct-Access(0) - VIRTIO Rev:
+---> Mounting file systems
+---> Starting Networking
+---> Starting sshd
+---> Starting misc
+Process count:19
+Startup complete
+QNX noname 8.0.0 2025/07/30-19:17:34EDT QEMU_virt aarch64le
 ```
 
-## Step 10: Verify Guest
+## Adding a Second Disk (for QVM Guest)
+
+To run a QVM guest, add a second virtio-blk device:
 
 ```bash
-# On the hypervisor host, check qvm status
-pidin | grep qvm
+# Add to startup.sh before rebuilding IFS:
+devb-virtio blk smem=0xa003c00,irq=78
+waitfor /dev/hd1 1000
 
-# Guest console output should show QNX boot messages
-# Guest has its own virtio-blk (/dev/hd1 passed through as vdev-virtio-blk)
+# Add to QEMU command line:
+-drive file=/tmp/qnx-guest-disk.img,format=raw,if=none,id=drv1 \
+-device virtio-blk-device,drive=drv1
 ```
 
 ---
@@ -221,9 +188,10 @@ pidin | grep qvm
 
 | Symptom | Cause | Fix |
 |---------|-------|-----|
-| Boot hangs immediately | X0 not set (no DTB) | Trampoline missing or wrong text_offset |
-| `startup` crash / no serial output | Wrong startup binary | Use `startup-qemu-virt` not `startup-armv8_fm` for host |
-| No `/dev/hd1` | Missing second virtio-blk | Add second `devb-virtio` with `smem=0xa003c00,irq=78` |
-| SSH connection refused | Network not up | Check `io-pkt` and `dhclient` in IFS build |
-| qvm fails to start guest | Missing guest IFS on disk | Verify `/data/qnx-guest-ifs.bin` exists on hd0 |
-| Guest boot hangs | Wrong vdev addresses | Verify guest.conf uses ARM FM addresses (see qvm-guest.conf) |
+| Serial log empty (0 bytes) | Wrong startup binary or trampoline | Use `startup-qemu-virt`, verify trampoline entry matches IFS |
+| `Bus error` on boot | `devc-virtio` using ARM FM MMIO address | Disable or fix `devc-virtio` address |
+| `No virtio interfaces found` | Wrong `smem` address for devb-virtio | Use `0x0a003e00,irq=79` for QEMU virt |
+| `network stack down: Bad file descriptor` | io-sock initialization race | Ensure `pipe`, `random`, `devc-pty` start before io-sock |
+| SSH timeout | Network not configured or host key mismatch | Check `ifconfig vtnet0`, clear known_hosts |
+| `if_up: network stack down` | Missing pipe/random/pty services | Ensure startup.sh initializes them before io-sock |
+| Trampoline loads but hangs | Entry point mismatch | `readelf -h ifs.bin` must match trampoline jump target |
