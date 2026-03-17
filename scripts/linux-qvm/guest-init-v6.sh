@@ -9,7 +9,7 @@
 export PATH=/bin:/sbin:/usr/bin:/usr/sbin
 export LD_LIBRARY_PATH=/lib:/lib/aarch64-linux-gnu
 
-RELAY_MODE=1
+RELAY_MODE=0
 HV_HOST_IP=10.10.10.1
 RELAY_PORT=20001
 GUEST_IP=10.10.10.3
@@ -71,15 +71,10 @@ if [ "$NET_FOUND" = "0" ]; then
 fi
 
 log "=== Starting Perfetto ==="
-/bin/traced &
-TRACED_PID=$!
-sleep 2
-
-/bin/traced_probes &
-PROBES_PID=$!
-sleep 2
 
 if [ "$RELAY_MODE" = "1" ] && [ "$NET_FOUND" = "1" ] && [ -x /bin/traced_relay ]; then
+    # Relay mode: traced_relay replaces traced as the producer socket listener.
+    # Do NOT run traced — relay forwards producers directly to remote traced.
     log "=== Starting relay to ${HV_HOST_IP}:${RELAY_PORT} ==="
     PERFETTO_RELAY_SOCK_NAME="${HV_HOST_IP}:${RELAY_PORT}" /bin/traced_relay &
     RELAY_PID=$!
@@ -90,17 +85,35 @@ if [ "$RELAY_MODE" = "1" ] && [ "$NET_FOUND" = "1" ] && [ -x /bin/traced_relay ]
         log "RELAY_DIED - falling back to standalone"
         RELAY_MODE=0
     fi
-else
-    if [ "$NET_FOUND" = "0" ]; then
-        log "No network — relay disabled"
-    elif [ ! -x /bin/traced_relay ]; then
-        log "No traced_relay binary — relay disabled"
-    fi
-    RELAY_MODE=0
 fi
 
-# Standalone local trace
-cat > /tmp/perfetto.cfg <<'PCFG'
+if [ "$RELAY_MODE" != "1" ]; then
+    # Standalone mode: run local traced
+    if [ "$NET_FOUND" = "0" ]; then
+        log "No network — standalone mode"
+    elif [ ! -x /bin/traced_relay ]; then
+        log "No traced_relay binary — standalone mode"
+    fi
+    /bin/traced &
+    TRACED_PID=$!
+    sleep 2
+fi
+
+/bin/traced_probes &
+PROBES_PID=$!
+sleep 2
+
+# In relay mode, traces are triggered from the host — skip local capture
+# In standalone mode, capture a local trace and save to virtio-blk
+if [ "$RELAY_MODE" = "1" ]; then
+    log "=== Relay mode: waiting for host to trigger trace (300s) ==="
+    log "HV host can trigger multi-VM trace now"
+    log "Linux probes forwarded via relay to ${HV_HOST_IP}:${RELAY_PORT}"
+    sleep 300
+    log "Relay window closed, shutting down"
+else
+    # Standalone local trace
+    cat > /tmp/perfetto.cfg <<'PCFG'
 duration_ms: 10000
 buffers { size_kb: 16384 }
 data_sources {
@@ -122,40 +135,37 @@ data_sources {
 }
 PCFG
 
-log "=== Capturing 10s local trace ==="
-/bin/perfetto --txt -c /tmp/perfetto.cfg -o /tmp/trace.pftrace
-RC=$?
-log "PERFETTO_DONE=$RC"
+    log "=== Capturing 10s local trace ==="
+    /bin/perfetto --txt -c /tmp/perfetto.cfg -o /tmp/trace.pftrace
+    RC=$?
+    log "PERFETTO_DONE=$RC"
 
-if [ -f /tmp/trace.pftrace ]; then
-    TRACE_SIZE=$(wc -c < /tmp/trace.pftrace)
-    log "TRACE_SIZE=$TRACE_SIZE"
-else
-    TRACE_SIZE=0
-    log "NO_TRACE_FILE"
-fi
-
-log "=== Writing trace to virtio-blk ==="
-SAVED=0
-for DEV in /dev/vda /dev/vdb /dev/sda /dev/sdb; do
-    if [ -b "$DEV" ]; then
-        log "Writing ${TRACE_SIZE} bytes to $DEV"
-        printf "%08d" "$TRACE_SIZE" | dd of="$DEV" bs=8 count=1 2>/dev/null
-        dd if=/tmp/trace.pftrace of="$DEV" bs=512 seek=1 2>/dev/null
-        log "TRACE_SAVED_TO=$DEV"
-        SAVED=1
-        break
+    if [ -f /tmp/trace.pftrace ]; then
+        TRACE_SIZE=$(wc -c < /tmp/trace.pftrace)
+        log "TRACE_SIZE=$TRACE_SIZE"
+    else
+        TRACE_SIZE=0
+        log "NO_TRACE_FILE"
     fi
-done
-[ "$SAVED" = "0" ] && log "NO_BLOCK_DEVICE"
 
-# Keep guest alive for relay and debugging (120s then shutdown)
-if [ "$RELAY_MODE" = "1" ]; then
-    log "=== Guest staying alive for relay (120s) ==="
-    log "HV host can trigger multi-VM trace now"
-    sleep 120
-    log "Relay window closed, shutting down"
+    log "=== Writing trace to virtio-blk ==="
+    SAVED=0
+    for DEV in /dev/vda /dev/vdb /dev/sda /dev/sdb; do
+        if [ -b "$DEV" ]; then
+            log "Writing ${TRACE_SIZE} bytes to $DEV"
+            printf "%08d" "$TRACE_SIZE" | dd of="$DEV" bs=8 count=1 2>/dev/null
+            dd if=/tmp/trace.pftrace of="$DEV" bs=512 seek=1 2>/dev/null
+            log "TRACE_SAVED_TO=$DEV"
+            SAVED=1
+            break
+            fi
+    done
+    [ "$SAVED" = "0" ] && log "NO_BLOCK_DEVICE"
 fi
+
+# Keep alive for trace extraction (60s)
+log "=== Staying alive 60s for trace extraction ==="
+sleep 60
 
 # Cleanup
 kill $TRACED_PID $PROBES_PID $RELAY_PID 2>/dev/null
