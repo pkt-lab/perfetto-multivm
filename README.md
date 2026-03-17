@@ -79,6 +79,7 @@ See [`docs/vsock-relay-guide.md`](docs/vsock-relay-guide.md) for full setup.
 | Path | Description |
 |---|---|
 | `docs/linux-qvm/README.md` | Linux ARM64 QVM guest tracing (Arch A, standalone) |
+| `docs/qnx-hypervisor/STATUS.md` | QNX HV on QEMU current status and blocker (2026-03-17) |
 | `docs/vsock-relay-guide.md` | Cross-VM relay setup guide (Arch B) |
 | `scripts/linux-qvm/build-initrd.sh` | Build initrd with Perfetto + virtio_blk.ko |
 | `scripts/linux-qvm/guest-init.sh` | Guest init: capture trace → write to /dev/vda |
@@ -97,7 +98,7 @@ See [`docs/vsock-relay-guide.md`](docs/vsock-relay-guide.md) for full setup.
 | A (virtio-blk) | QNX 8.0 HV (aarch64 QEMU on x86_64) | Linux 6.1.0-42-arm64 (QVM) | ✅ 17KB trace |
 | B (vsock relay) | Linux 6.14 (aarch64, 20 CPUs) | AGL Terrific Trout 6.6.84 via QEMU | ✅ |
 | HV boot | x86_64 Linux (AMD Ryzen) | QNX 8.0 HV (aarch64 TCG) | ✅ SSH + qvm |
-| HV boot | aarch64 Linux (NVIDIA GB10) | QNX 8.0 HV (aarch64 TCG) | ✅ SSH + qvm |
+| HV boot | aarch64 Linux (NVIDIA GB10) | QNX 8.0 HV (aarch64 TCG) | ✅ SSH + qvm (⚠️ qvm blocked — see [STATUS](docs/qnx-hypervisor/STATUS.md)) |
 
 ## Roadmap
 
