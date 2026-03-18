@@ -1,121 +1,131 @@
 # perfetto-multivm
 
-Multi-machine Perfetto tracing via vsock relay — **online, single `.pftrace`, no offline merge**.
+Multi-machine Perfetto tracing for QNX Hypervisor — **unified 3-VM traces in a single `.pftrace`**.
 
 ## What This Is
 
-Demonstrates Perfetto's `traced_relay` architecture for cross-VM tracing. A single `perfetto` CLI command captures scheduling, process, and ftrace data from both a host Linux system and one or more QEMU guests simultaneously.
+Production-ready multi-VM tracing using Perfetto's `traced_relay` architecture. A single `perfetto` CLI command captures QNX kernel scheduling, Linux ftrace, and process data from a QNX hypervisor host and its guest VMs simultaneously.
+
+Verified: 3-VM unified trace (QNX host + QNX guest + Linux guest), 15-30s captures, zero data loss, 100% thread-process association.
 
 ```
-Host traced ◄──vsock──► Guest traced_relay ◄──UNIX──► Guest traced_probes
-     │                                                        │
-  consumers                                             ftrace / procstats
-  .pftrace out                                         (guest kernel data)
+QNX HV host
+├── traced (listens on Unix + TCP:20001)
+├── traced_qnx_probes (host kernel scheduler events)
+│
+├── QNX guest (qvm)
+│   ├── traced_relay → TCP 10.10.10.1:20001
+│   └── traced_qnx_probes (guest kernel events)
+│
+└── Linux guest (qvm)
+    ├── traced_relay → vsock://2:20001 or TCP 10.10.10.1:20001
+    └── traced_probes (ftrace: sched, task events)
 ```
 
-## Quick Start
+## Transport Options
 
-See [`docs/vsock-relay-guide.md`](docs/vsock-relay-guide.md) for full setup.
+| Transport | Guest | Status | How |
+|-----------|-------|--------|-----|
+| **TCP** | QNX guest | Verified | vdevpeer-net IP routing |
+| **TCP** | Linux guest | Verified | vdevpeer-net IP routing |
+| **vsock** | Linux guest | Verified | vdev-virtio-vsock plugin |
+| **vsock** | QNX guest | In progress | libvsock.so LD_PRELOAD shim |
 
-```bash
-# 1. Host: start traced with relay endpoint (as root)
-sudo bash scripts/start-host-traced.sh /path/to/perfetto-v54
-
-# 2. Guest: start relay + probes
-bash scripts/start-guest-relay.sh /tmp/tracebox54
-
-# 3. Host: record (MUST include trace_all_machines: true)
-PERFETTO_CONSUMER_SOCK_NAME=/tmp/pf-consumer \
-  perfetto -c configs/multivm-basic.pbtxt --txt -o out.pftrace
-```
+vsock source code is in the private [pkt-lab/qnx-virtio-vsock](https://github.com/pkt-lab/qnx-virtio-vsock) repository.
 
 ## Key Finding: Perfetto v54 Breaking Change
 
-`trace_all_machines: true` is **required** in the trace config starting from v54.  
-Without it, remote machine (relay-connected) producers are silently filtered out and no guest data is recorded.
+`trace_all_machines: true` is **required** in the trace config starting from v54.
+Without it, relay-connected guest producers are silently filtered out and no guest data is recorded.
 
-Source: `src/tracing/service/tracing_service_impl.cc`:
-```cpp
-} else if (!tracing_session->config.trace_all_machines() && !is_host_machine) {
-    // Default in v54: only trace host machine
-    return nullptr;
-}
+## Quick Start (3-VM Trace)
+
+```bash
+# On QNX HV host (via SSH):
+
+# 1. Start traced with relay endpoint
+PERFETTO_PRODUCER_SOCK_NAME=/data/sock/perfetto-producer,0.0.0.0:20001 \
+PERFETTO_CONSUMER_SOCK_NAME=/data/sock/perfetto-consumer \
+LD_LIBRARY_PATH=/proc/boot:/data \
+/data/traced --enable-relay-endpoint &
+
+# 2. Start host probes
+PERFETTO_PRODUCER_SOCK_NAME=/data/sock/perfetto-producer \
+LD_LIBRARY_PATH=/proc/boot:/data \
+/data/traced_qnx_probes &
+
+# 3. Boot guests (they auto-connect via relay)
+qvm @/dev/shmem/qnx-guest.conf &
+qvm @/dev/shmem/linux-guest.conf &
+
+# 4. Capture unified trace (writes to shmem to avoid /data disk limits)
+PERFETTO_CONSUMER_SOCK_NAME=/data/sock/perfetto-consumer \
+LD_LIBRARY_PATH=/proc/boot:/data \
+/data/perfetto -o /dev/shmem/trace.pftrace \
+  -c configs/multivm-3vm.pbtxt --txt
 ```
 
-## Architectures
+## Verified Results
 
-### A: Standalone Guest Trace (virtio-blk)
-
-Linux ARM64 guest inside QNX Hypervisor captures its own trace and writes it
-to a virtio-blk device — no host connectivity required.
-
-```
-AMD host (x86_64)
-└── QEMU (aarch64)
-    └── QNX Hypervisor 8.0
-        └── Linux 6.1 ARM64 guest
-            ├── traced + traced_probes
-            └── /dev/vda ──► /data/linux-trace.img (on QNX HV)
-```
-
-See [`docs/linux-qvm/README.md`](docs/linux-qvm/README.md) for full setup.
-
-### B: Cross-VM Relay (vsock/TCP)
-
-Host `traced` with relay endpoint collects from guest `traced_relay` + `traced_probes`
-into a single merged `.pftrace`. Requires vsock or TCP connectivity.
-
-```
-Host traced ◄──vsock──► Guest traced_relay ◄──UNIX──► Guest traced_probes
-     │                                                        │
-  consumers                                             ftrace / procstats
-  .pftrace out                                         (guest kernel data)
-```
-
-See [`docs/vsock-relay-guide.md`](docs/vsock-relay-guide.md) for full setup.
+| Metric | TCP (both guests) | vsock (Linux) + TCP (QNX) |
+|--------|-------------------|---------------------------|
+| File size (15s) | 23.2 MB | 24.0 MB |
+| Host sched events | 115,849 | 110,225 |
+| Linux guest sched | 383 | 374 |
+| QNX guest sched | 84,564 | 88,809 |
+| Thread-process assoc | 100% all machines | 100% all machines |
+| Data loss | 0 | 0 |
 
 ## Contents
 
 | Path | Description |
-|---|---|
-| `docs/linux-qvm/README.md` | Linux ARM64 QVM guest tracing (Arch A, standalone) |
-| `docs/vsock-relay-guide.md` | Cross-VM relay setup guide (Arch B) |
-| `scripts/linux-qvm/build-initrd.sh` | Build initrd with Perfetto + virtio_blk.ko |
-| `scripts/linux-qvm/guest-init.sh` | Guest init: capture trace → write to /dev/vda |
-| `scripts/linux-qvm/boot-and-capture.sh` | Boot QVM guest and extract trace (from AMD host) |
-| `scripts/build-and-boot-hyp.sh` | Automated: build + patch + boot QNX HV on QEMU |
-| `scripts/start-host-traced.sh` | Start host traced with vsock relay endpoint |
-| `scripts/start-guest-relay.sh` | Start guest traced_relay + traced_probes |
-| `configs/linux-guest-ftrace.pbtxt` | Perfetto config for Linux QVM guest (Arch A) |
-| `configs/multivm-basic.pbtxt` | Basic multi-machine trace config (Arch B) |
-| `configs/multivm-clocksync-test.pbtxt` | Clock sync precision test config |
+|------|-------------|
+| `configs/multivm-3vm.pbtxt` | 3-VM trace config (separate buffers, QNX + Linux) |
+| `configs/multivm-basic.pbtxt` | Basic multi-machine config (trace_all_machines: true) |
+| `scripts/validate-trace.sh` | 9-point automated trace quality validation |
+| `scripts/clocksync-validate.sh` | Multi-machine clock sync validation |
+| `scripts/capture-3vm-trace.sh` | End-to-end 3-VM trace capture + download |
+| `scripts/start-3vm-perfetto.sh` | Start full 3-VM tracing stack on HV |
+| `scripts/start-host-traced.sh` | Start host traced with relay endpoint |
+| `scripts/start-guest-relay.sh` | Start guest traced_relay + probes |
+| `scripts/linux-qvm/guest-init-v8.sh` | Linux guest init (low-churn workloads) |
+| `scripts/linux-qvm/guest-init-v9.sh` | Linux guest init (vsock auto-detect + TCP fallback) |
+| `docs/qnx-hypervisor/ARCHITECTURE.md` | 3-VM system architecture + data flow |
+| `docs/qnx-hypervisor/SETUP.md` | Step-by-step QNX HV reproduction guide |
+| `docs/qnx-hypervisor/NEXT-PHASES.md` | Phase status: validation, vsock, FVP, ETM |
+| `docs/clocksync-analysis.md` | Clock sync precision analysis |
 
-## Tested Environments
+## Related Repositories
 
-| Architecture | Host | Guest | Status |
-|---|---|---|---|
-| A (virtio-blk) | QNX 8.0 HV (aarch64 QEMU on x86_64) | Linux 6.1.0-42-arm64 (QVM) | ✅ 17KB trace |
-| B (vsock relay) | Linux 6.14 (aarch64, 20 CPUs) | AGL Terrific Trout 6.6.84 via QEMU | ✅ |
-| HV boot | x86_64 Linux (AMD Ryzen) | QNX 8.0 HV (aarch64 TCG) | ✅ SSH + qvm |
-| HV boot | aarch64 Linux (NVIDIA GB10) | QNX 8.0 HV (aarch64 TCG) | ✅ SSH + qvm (⚠️ qvm blocked) |
+| Repository | Branch | Description |
+|------------|--------|-------------|
+| [pkt-lab/perfetto](https://github.com/pkt-lab/perfetto) | `qnx-main` | QNX Perfetto fork (all patches) |
+| [pkt-lab/perfetto](https://github.com/pkt-lab/perfetto) | `qnx-tcp` | TCP transport patches |
+| [pkt-lab/perfetto](https://github.com/pkt-lab/perfetto) | `qnx-vsock` | vsock transport patches |
+| [pkt-lab/qnx-virtio-vsock](https://github.com/pkt-lab/qnx-virtio-vsock) | `main` | vsock vdev plugin + libvsock (private) |
 
-## Roadmap
+## Perfetto Fork Patches (pkt-lab/perfetto)
 
-- [x] Clock sync precision analysis (mean offset +1.51ms, 100% vCPU correlation)
-- [x] Linux ARM64 QVM guest with virtio-blk trace output (Arch A)
-- [ ] Architecture B: QNX HV `traced_relay` → AMD host `traced` via TCP
-- [ ] Linux + Android dual-VM test
-- [ ] Multi-hypervisor support: QNX Hypervisor, Xen, pKVM
-- [ ] Automated clock correlation script
+6 patches on top of qnx-ports/perfetto:
 
-## Requirements
+| Commit | Description | Needed for |
+|--------|-------------|------------|
+| `7d356becdc` | Add traced_qnx_probes for QNX SDP7.1 | Both |
+| `17ca190325` | Error out on startup tracelog failure | Both |
+| `efae914cda` | Populate set_is_idle in GenericKernelProcessTree | Both |
+| `5e31b13665` | Fix QNX 8.0 compatibility for traced_qnx_probes | Both |
+| `8b3ddc082d` | Fix SCM_RIGHTS failure on TCP for traced_relay | TCP + vsock |
+| `b982fdcd82` | Fix QNX guest thread naming and process association | Both |
 
-- Perfetto v54.0+ binaries ([releases](https://github.com/google/perfetto/releases))
-- QEMU with `-device vhost-vsock-device,guest-cid=<N>`
-- Host: `vhost_vsock` kernel module, user in `kvm` group
-- Guest: `CONFIG_VIRTIO_VSOCKETS=y`, `/dev/vsock` present
+## Environment
+
+Tested on NVIDIA GB10 (Orin) with QEMU 9.2.3:
+- QNX Hypervisor 8.0 host (aarch64, 4 vCPU, 2GB RAM)
+- QNX 8.0 guest (1 vCPU, 512MB) via qvm
+- Linux AGL 6.6.84 guest (2 vCPU, 512MB) via qvm
+- Inter-VM networking: vdevpeer-net (10.10.10.x)
 
 ## License
 
-Scripts and configs: MIT  
+Scripts and configs: MIT
 Perfetto: Apache 2.0
