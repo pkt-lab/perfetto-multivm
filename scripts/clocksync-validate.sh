@@ -1,9 +1,13 @@
 #!/usr/bin/env bash
 # clocksync-validate.sh
 # Validate clock synchronization in a multi-machine Perfetto trace
+# Correlates host vCPU scheduling with guest task scheduling for ALL guests.
+#
 # Requires: python3 + perfetto pip package (pip3 install perfetto)
 #
 # Usage: bash clocksync-validate.sh <trace.pftrace>
+#
+# Exit codes: 0=PASS, 1=WARN, 2=FAIL
 
 set -euo pipefail
 
@@ -13,74 +17,143 @@ if [[ -z "$TRACE" || ! -f "$TRACE" ]]; then
   exit 1
 fi
 
-python3 << PYEOF
+export _TRACE_PATH="$TRACE"
+python3 << 'PYEOF'
 from perfetto.trace_processor import TraceProcessor
-import statistics, sys
+import statistics, sys, json, os
 
-tp = TraceProcessor(trace='$TRACE')
+trace_path = os.environ['_TRACE_PATH']
+tp = TraceProcessor(trace=trace_path)
 
 print("=== Perfetto Multi-Machine Clock Sync Validator ===")
-print(f"Trace: $TRACE\n")
+print(f"Trace: {trace_path}\n")
 
 # Machines
-machines = list(tp.query("SELECT id, release, num_cpus FROM machine;"))
+machines = list(tp.query("SELECT id, release, num_cpus FROM machine ORDER BY id;"))
 for m in machines:
     print(f"  machine [{m.id}]: {m.release} ({m.num_cpus} CPUs)")
 if len(machines) < 2:
     print("ERROR: < 2 machines. Set trace_all_machines: true in your trace config.")
-    sys.exit(1)
+    sys.exit(2)
 print()
 
-# QEMU vCPU tids
-qemu_rows = list(tp.query("SELECT t.tid FROM thread t JOIN process p ON t.upid=p.upid WHERE t.machine_id=0 AND p.name GLOB '*qemu*';"))
-vcpu_tids = ",".join(str(r.tid) for r in qemu_rows)
+host_id = 0
+guest_ids = [m.id for m in machines if m.id != host_id]
+
+# Find host hypervisor/QEMU vCPU threads
+# Try qvm (QNX HV) first, then QEMU
+qvm_rows = list(tp.query(
+    f"SELECT t.tid FROM thread t JOIN process p ON t.upid=p.upid "
+    f"WHERE t.machine_id={host_id} AND p.name GLOB '*qvm*';"
+))
+qemu_rows = list(tp.query(
+    f"SELECT t.tid FROM thread t JOIN process p ON t.upid=p.upid "
+    f"WHERE t.machine_id={host_id} AND p.name GLOB '*qemu*';"
+))
+
+vcpu_rows = qvm_rows if qvm_rows else qemu_rows
+vcpu_source = "qvm" if qvm_rows else "QEMU"
+vcpu_tids = ",".join(str(r.tid) for r in vcpu_rows)
+
 if not vcpu_tids:
-    print("No QEMU threads found (is host running QEMU?)")
-    sys.exit(0)
-print(f"Host QEMU threads: {[r.tid for r in qemu_rows]}")
+    print("No hypervisor vCPU threads found (qvm or QEMU)")
+    print("Cannot perform clock sync correlation without host vCPU threads.")
+    sys.exit(1)
 
-# Sched events
-host_rows = list(tp.query(f"SELECT ss.ts, ss.dur FROM sched_slice ss JOIN thread t ON ss.utid=t.utid WHERE t.machine_id=0 AND t.tid IN ({vcpu_tids});"))
-guest_rows = list(tp.query("SELECT ss.ts, ss.dur FROM sched_slice ss JOIN thread t ON ss.utid=t.utid WHERE t.machine_id=1 AND ss.dur > 500000 LIMIT 500;"))
-print(f"Host vCPU sched events: {len(host_rows)}")
-print(f"Guest sched events > 0.5ms: {len(guest_rows)}")
-print()
+print(f"Host {vcpu_source} threads ({len(vcpu_rows)}): {[r.tid for r in vcpu_rows]}")
 
-if not guest_rows:
-    print("No guest sched events found."); sys.exit(0)
+# Get all host vCPU sched events
+host_sched = list(tp.query(
+    f"SELECT ss.ts, ss.dur FROM sched_slice ss "
+    f"JOIN thread t ON ss.utid=t.utid "
+    f"WHERE t.machine_id={host_id} AND t.tid IN ({vcpu_tids});"
+))
+host = [(r.ts, r.dur) for r in host_sched]
+print(f"Host vCPU sched events: {len(host)}\n")
 
-host = [(r.ts, r.dur) for r in host_rows]
-guest = [(r.ts, r.dur) for r in guest_rows]
+overall = "PASS"
+results = []
 
-# Correlation
-overlaps, no_overlaps, offsets = 0, 0, []
-for g_ts, g_dur in guest:
-    g_end = g_ts + g_dur
-    matching = [h for h in host if h[0] < g_end and h[0]+h[1] > g_ts]
-    if matching:
-        overlaps += 1
-        offsets.append(min((h[0]-g_ts)/1e6 for h in matching, key=abs))
+for guest_id in guest_ids:
+    guest_info = [m for m in machines if m.id == guest_id][0]
+    print(f"--- Guest machine {guest_id}: {guest_info.release} ---")
+
+    guest_sched = list(tp.query(
+        f"SELECT ss.ts, ss.dur FROM sched_slice ss "
+        f"JOIN thread t ON ss.utid=t.utid "
+        f"WHERE t.machine_id={guest_id} AND ss.dur > 500000 LIMIT 500;"
+    ))
+    print(f"  Guest sched events > 0.5ms: {len(guest_sched)}")
+
+    if not guest_sched:
+        print("  SKIP: No guest sched events found.\n")
+        results.append({"machine_id": guest_id, "status": "SKIP", "overlap_pct": 0})
+        continue
+
+    guest = [(r.ts, r.dur) for r in guest_sched]
+
+    # Correlation: for each guest event, find overlapping host vCPU events
+    overlaps, no_overlaps, offsets = 0, 0, []
+    for g_ts, g_dur in guest:
+        g_end = g_ts + g_dur
+        matching = [h for h in host if h[0] < g_end and h[0] + h[1] > g_ts]
+        if matching:
+            overlaps += 1
+            offsets.append(min(((h[0] - g_ts) / 1e6 for h in matching), key=abs))
+        else:
+            no_overlaps += 1
+
+    total = overlaps + no_overlaps
+    pct = 100 * overlaps // total if total else 0
+
+    print(f"  Overlap rate: {overlaps}/{total} ({pct}%)")
+    if offsets:
+        print(f"  Onset offset (host_vCPU_start - guest_task_start):")
+        print(f"    mean={statistics.mean(offsets):+.2f}ms  median={statistics.median(offsets):+.2f}ms")
+        if len(offsets) > 1:
+            print(f"    stdev={statistics.stdev(offsets):.2f}ms")
+        s = sorted(offsets)
+        print(f"    p5={s[int(0.05*len(s))]:+.2f}ms  p95={s[int(0.95*len(s))]:+.2f}ms")
+        print(f"    min={min(offsets):+.2f}ms  max={max(offsets):+.2f}ms")
+
+    if pct >= 95:
+        status = "PASS"
+        print(f"  PASS: Clock alignment GOOD (>= 95% overlap)\n")
+    elif pct >= 80:
+        status = "WARN"
+        if overall == "PASS":
+            overall = "WARN"
+        print(f"  WARN: Marginal alignment ({pct}%). Check clock sync.\n")
     else:
-        no_overlaps += 1
+        status = "FAIL"
+        overall = "FAIL"
+        print(f"  FAIL: Poor alignment ({pct}%). Significant clock offset likely.\n")
 
-total = overlaps + no_overlaps
-pct = 100 * overlaps // total if total else 0
+    result = {"machine_id": guest_id, "status": status, "overlap_pct": pct}
+    if offsets:
+        result["mean_offset_ms"] = round(statistics.mean(offsets), 2)
+        result["median_offset_ms"] = round(statistics.median(offsets), 2)
+    results.append(result)
 
-print("=== Results ===")
-print(f"  Overlap rate: {overlaps}/{total} ({pct}%)")
-if offsets:
-    print(f"  Onset offset (host_vCPU_start - guest_task_start):")
-    print(f"    mean={statistics.mean(offsets):+.2f}ms  median={statistics.median(offsets):+.2f}ms")
-    print(f"    stdev={statistics.stdev(offsets):.2f}ms")
-    s = sorted(offsets)
-    print(f"    p5={s[int(0.05*len(s))]:+.2f}ms  p95={s[int(0.95*len(s))]:+.2f}ms")
-    print(f"    min={min(offsets):+.2f}ms  max={max(offsets):+.2f}ms")
-print()
-if pct >= 95:
-    print("  ✅ PASS: Clock alignment GOOD (>=95% overlap)")
-    print("     Note: non-zero onset offset is QEMU scheduling latency, not clock error.")
-elif pct >= 80:
-    print("  ⚠️  WARN: Marginal alignment. Check clock sync configuration.")
+print(f"=== Overall: {overall} ===")
+
+# Write JSON report
+json_path = trace_path.replace(".pftrace", "-clocksync.json")
+report = {
+    "trace": trace_path,
+    "result": overall,
+    "vcpu_source": vcpu_source,
+    "host_vcpu_events": len(host),
+    "guests": results,
+}
+with open(json_path, "w") as f:
+    json.dump(report, f, indent=2)
+print(f"Report: {json_path}")
+
+if overall == "FAIL":
+    sys.exit(2)
+elif overall == "WARN":
+    sys.exit(1)
 else:
-    print("  ❌ FAIL: Poor alignment. Significant clock offset likely.")
+    sys.exit(0)
 PYEOF
