@@ -68,7 +68,9 @@ fi
 # 4. Install init script
 echo "[4/5] Installing init script..."
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-cp "$SCRIPT_DIR/guest-init.sh" init
+INIT_SCRIPT="${INIT_SCRIPT:-$SCRIPT_DIR/guest-init-v8.sh}"
+echo "  Init script: $INIT_SCRIPT"
+cp "$INIT_SCRIPT" init
 chmod 755 init
 
 # 5. Repack

@@ -1,87 +1,99 @@
 # Multi-VM Perfetto Relay Architecture
 
-## System Diagram
+## System Diagram (3-VM: QNX Host + QNX Guest + Linux Guest)
 
 ```
-┌─────────────────────────────────────────────────────┐
-│                    gb10 Host (Linux)                  │
-│  QEMU 9.2.3 (virt-4.2, cortex-a57, smp 4, 2G)      │
-│  SSH: localhost:2241 → QNX HV:22                     │
-├─────────────────────────────────────────────────────┤
-│              QNX 8.0 HV Host (procnto-smp-instr)     │
-│                                                       │
-│  io-sock ─── vtnet0 (10.0.2.15, QEMU NAT)           │
-│         └── vp0 (10.10.10.1/24, vdevpeer-net)       │
-│                    │                                  │
-│  traced (--enable-relay-endpoint)                     │
-│    ├── Unix: /data/sock/perfetto-producer            │
-│    └── TCP: 0.0.0.0:20001                            │
-│  traced_qnx_probes ──→ /data/sock/perfetto-producer  │
-│  perfetto (consumer) ──→ /data/sock/perfetto-consumer │
-│                    │                                  │
-│         ┌─────────┴──────────┐                       │
-│         │   vdevpeer-net     │                       │
-│         │  (patched .so)     │                       │
-│         └─────────┬──────────┘                       │
-│                   │ vpctl                             │
-├───────────────────┼─────────────────────────────────┤
-│    QNX Guest (qvm)│                                  │
-│                   │                                  │
-│  vtnet0 (10.10.10.2/24) ←── vdev-virtio-net (patched)│
-│                                                       │
-│  ext2 on devb-ram → /ramfs/sock/ (AF_UNIX)           │
-│                                                       │
-│  traced_relay ──→ TCP 10.10.10.1:20001               │
-│    └── local: /ramfs/sock/perfetto-producer          │
-│  traced_qnx_probes ──→ /ramfs/sock/perfetto-producer │
-└─────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────┐
+│                    gb10 Host (Linux x86_64)                │
+│  QEMU 9.2.3 (virt-4.2, cortex-a57, smp 4, 2G)           │
+│  SSH: localhost:2241 → QNX HV:22                          │
+├──────────────────────────────────────────────────────────┤
+│              QNX 8.0 HV Host (procnto-smp-instr)          │
+│                                                            │
+│  io-sock ─── vtnet0 (10.0.2.15, QEMU NAT)                │
+│         ├── vp0 (10.10.10.1/24) ←→ Linux guest            │
+│         └── vp1 (10.10.10.1/24) ←→ QNX guest              │
+│                                                            │
+│  traced (--enable-relay-endpoint)                          │
+│    ├── Unix: /data/sock/perfetto-producer                 │
+│    └── TCP: 0.0.0.0:20001                                 │
+│  traced_qnx_probes ──→ /data/sock/perfetto-producer       │
+│  perfetto (consumer) ──→ /data/sock/perfetto-consumer      │
+│                                                            │
+│         ┌───────────────────────────────┐                  │
+│         │     vdevpeer-net (patched)    │                  │
+│         │   vp0 ←→ Linux   vp1 ←→ QNX  │                  │
+│         └───────────┬───────────┬───────┘                  │
+│                     │           │                           │
+├─────────────────────┼───────────┼──────────────────────────┤
+│  Linux Guest (qvm)  │           │  QNX Guest (qvm)         │
+│  AGL 6.6.84 kernel  │           │  QNX 8.0 IFS             │
+│                     │           │                           │
+│  eth0 10.10.10.3/24 │           │  vtnet0 10.10.10.2/24    │
+│                     │           │                           │
+│  traced_relay ──────┼── TCP ────┼──→ host:20001            │
+│  traced_probes      │           │  traced_relay ──→ :20001  │
+│  (linux.ftrace)     │           │  traced_qnx_probes       │
+│                     │           │  (qnx.kernel)             │
+│  Workloads:         │           │                           │
+│   cpu_arith, mem,   │           │  ext2 on devb-ram         │
+│   io_builtin, net,  │           │  /ramfs/sock/ (AF_UNIX)   │
+│   io_periodic       │           │                           │
+└─────────────────────┴───────────┴──────────────────────────┘
 ```
 
-## Data Flow
+## Data Flow (3-VM Unified Trace)
 
 ```
-QNX Guest                          QNX HV Host
-─────────                          ───────────
+Linux Guest              QNX Guest                   QNX HV Host
+────────────             ──────────                  ───────────
 
-traced_qnx_probes                  traced_qnx_probes
-      │                                  │
-      ▼                                  ▼
- AF_UNIX socket                    AF_UNIX socket
- /ramfs/sock/                      /data/sock/
- perfetto-producer                 perfetto-producer
-      │                                  │
-      ▼                                  ▼
- traced_relay ─── TCP 20001 ───→  traced (--enable-relay-endpoint)
-                                         │
-                                         ▼
-                                   perfetto (consumer)
-                                   /data/sock/perfetto-consumer
-                                         │
-                                         ▼
-                                   multivm.pftrace
-                                   (unified trace, 2 machine IDs)
+traced_probes            traced_qnx_probes           traced_qnx_probes
+(linux.ftrace)           (qnx.kernel)                (qnx.kernel)
+      │                        │                           │
+      ▼                        ▼                           ▼
+ /tmp/perfetto-          AF_UNIX socket              AF_UNIX socket
+  producer               /ramfs/sock/                /data/sock/
+      │                  perfetto-producer           perfetto-producer
+      ▼                        │                           │
+ traced_relay                  ▼                           │
+      │                  traced_relay                      │
+      │                        │                           │
+      └──── TCP 20001 ────────┘──── TCP 20001 ───→  traced
+                                                    (--enable-relay-endpoint)
+                                                          │
+                                                          ▼
+                                                    perfetto (consumer)
+                                                    /data/sock/perfetto-consumer
+                                                          │
+                                                          ▼
+                                                    3vm.pftrace
+                                                    (unified trace, 3 machine IDs)
 ```
 
 ## Network Topology
 
 ```
-Internet ←→ QEMU NAT ←→ vtnet0 (10.0.2.15)     [HV Host external access]
+Internet ←→ QEMU NAT ←→ vtnet0 (10.0.2.15)        [HV Host external access]
                               │
                           QNX io-sock
                               │
-             SSH:2241 ←→ sshd (port 22)          [Management access]
+             SSH:2241 ←→ sshd (port 22)             [Management access]
                               │
-                          vp0 (10.10.10.1/24)     [HV Host peer interface]
-                              │
-                        vdevpeer-net (patched)
-                              │
-                        vpctl binding
-                              │
-                   /dev/qvm/qnx-guest/p2p
-                              │
-                     vdev-virtio-net (patched)
-                              │
-                        vtnet0 (10.10.10.2/24)    [Guest interface]
+                 ┌────────────┴────────────┐
+                 │                         │
+           vp0 (10.10.10.1)         vp1 (10.10.10.1)
+                 │                         │
+           vdevpeer-net              vdevpeer-net
+                 │                         │
+           Linux guest               QNX guest
+           eth0 10.10.10.3          vtnet0 10.10.10.2
+```
+
+**Important**: Both vp0 and vp1 share the same subnet (10.10.10.0/24). The HV host needs explicit routes:
+```bash
+/system/bin/route add -host 10.10.10.2 -iface vp1
+/system/bin/route add -host 10.10.10.3 -iface vp0
 ```
 
 ## Component Details
@@ -108,6 +120,38 @@ The host `traced` listens on both Unix and TCP sockets simultaneously using comm
 
 ### Trace Output
 
-The unified trace contains events from both VMs, distinguished by machine ID:
-- Machine ID `0`: HV host (QEMU_virt)
-- Machine ID `3419721831`: Guest (ARMv8_Foundation_Model)
+The unified trace contains events from all VMs, distinguished by machine ID:
+- Machine ID `0`: QNX HV host (QEMU_virt)
+- Machine ID `1`: Linux guest (AGL 6.6.84)
+- Machine ID `2`: QNX guest (ARMv8_Foundation_Model)
+
+Machine IDs are assigned by the trace processor based on `trusted_packet_sequence_id` and remote clock domains.
+
+### Separate Trace Buffers
+
+Using a single ring buffer causes data loss: QNX kernel events (~470K sched events/min) overwrite Linux ftrace data. The solution is separate buffers:
+- Buffer 0 (128MB): QNX kernel events (`qnx.kernel` data source)
+- Buffer 1 (64MB): Linux ftrace + process stats
+
+See `configs/multivm-3vm.pbtxt` for the reference config.
+
+### Thread Naming on QNX
+
+QNX threads don't inherently have names (unlike Linux). Thread-process association is achieved by:
+1. Emitting `GenericKernelProcessTree` events on first sched event for each thread
+2. Emitting process tree on thread rename (`HandleThreadNamed`)
+3. Setting `comm` field on `GenericKernelTaskStateEvent` entries
+4. Not skipping processes without `cmdline` in the trace processor
+
+These fixes are in pkt-lab/perfetto branch `qnx-main` (commit `b982fdcd82`).
+
+### Linux Guest Workload Design
+
+The Linux guest init v8 uses in-process workloads to avoid flooding the trace with short-lived processes:
+- **cpu_arith**: Shell arithmetic loops (no fork/exec)
+- **mem_work**: Shell variable manipulation
+- **io_builtin**: `read` builtin for /proc files (no `cat`)
+- **net_slow**: One `ping` every 5s
+- **io_periodic**: One `dd` every 10s
+
+Previous versions (v6/v7) spawned `seq`, `cat`, `grep`, `wc`, `ps` rapidly, creating thousands of zombie process entries in the trace.
