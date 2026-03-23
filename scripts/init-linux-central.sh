@@ -1,40 +1,37 @@
 #!/bin/sh
 # Linux guest init — CENTRAL traced role
 #
-# This guest runs the central traced service that QNX machines relay to.
-# Topology:
-#   - traced listens on TCP 0.0.0.0:20001 (--enable-relay-endpoint)
-#   - traced_probes connects locally for Linux ftrace + process_stats
-#   - perfetto CLI triggers auto-capture after relay settle time
+# Runs upstream Perfetto traced as the central trace service.
+# QNX machines connect as relay clients via TCP.
 #
-# Network: 10.10.10.3/24 via vdevpeer-net to QNX host (10.10.10.1)
-# Trace output: served via netcat on TCP:9999
+# Trace output served via netcat on TCP:9999 for download.
 
-export LD_LIBRARY_PATH=/lib:/usr/lib
-export PATH=/bin:/sbin:/usr/bin:/usr/sbin
+export PATH=/bin:/sbin
+export LD_LIBRARY_PATH=/lib:/lib/aarch64-linux-gnu
 
 LISTEN_PORT="${LISTEN_PORT:-20001}"
 GUEST_IP="${GUEST_IP:-10.10.10.3}"
 HOST_IP="${HOST_IP:-10.10.10.1}"
 SETTLE_TIME="${SETTLE_TIME:-30}"
-TRACE_DURATION="${TRACE_DURATION:-30}"
+PRODUCER_SOCK=/tmp/perfetto-sockets/perfetto-producer
+CONSUMER_SOCK=/tmp/perfetto-sockets/perfetto-consumer
 
 log() { echo "LINUX-CENTRAL: $1"; }
 log "=== Linux Central Traced Guest ==="
 
-# Mount essential filesystems
+# Mount filesystems
 mkdir -p /proc /sys /dev /tmp /run /data 2>/dev/null
-busybox mount -t proc proc /proc
-busybox mount -t sysfs sysfs /sys
-busybox mount -t devtmpfs devtmpfs /dev
-busybox mount -t tmpfs tmpfs /tmp
-busybox mount -t tmpfs tmpfs /run
-busybox mount -t tmpfs tmpfs /data
-busybox mount -t tracefs tracefs /sys/kernel/tracing 2>/dev/null
-busybox mount -t debugfs debugfs /sys/kernel/debug 2>/dev/null
+mount -t proc proc /proc
+mount -t sysfs sysfs /sys
+mount -t devtmpfs devtmpfs /dev
+mount -t tmpfs tmpfs /tmp
+mount -t tmpfs tmpfs /run
+mount -t tmpfs tmpfs /data
+mount -t tracefs tracefs /sys/kernel/tracing 2>/dev/null
+mount -t debugfs debugfs /sys/kernel/debug 2>/dev/null
 
-# Try loading kernel modules
-for KVER in 6.6.84-yocto-standard 6.1.0-42-arm64; do
+# Load modules
+for KVER in 6.6.84-yocto-standard; do
     KMOD="/lib/modules/$KVER/kernel/drivers"
     if [ -d "$KMOD" ]; then
         insmod $KMOD/virtio/virtio_mmio.ko 2>/dev/null
@@ -44,108 +41,75 @@ for KVER in 6.6.84-yocto-standard 6.1.0-42-arm64; do
 done
 sleep 2
 
-# Network setup — find first available interface
+# Network
 log "=== Network setup ==="
-NET_OK=0
 for IFACE in eth0 enp0s1 ens0 ens1; do
-    if [ -e "/sys/class/net/${IFACE}" ]; then
-        log "Found interface: ${IFACE}"
-        busybox ip link set "${IFACE}" up 2>/dev/null
+    if [ -e "/sys/class/net/$IFACE" ]; then
+        log "Found: $IFACE"
+        ip link set "$IFACE" up 2>/dev/null
         sleep 1
-        busybox ip addr add "${GUEST_IP}/24" dev "${IFACE}" 2>/dev/null
-        sleep 1
-        busybox ip addr show "${IFACE}" 2>/dev/null
-        ping -c 2 -W 3 "${HOST_IP}" 2>&1
-        if [ $? -eq 0 ]; then
-            log "Network OK: ${IFACE} ${GUEST_IP} -> ${HOST_IP} reachable"
-        else
-            log "WARN: ping to ${HOST_IP} failed, relay may still connect"
-        fi
-        NET_OK=1
+        ip addr add "${GUEST_IP}/24" dev "$IFACE" 2>/dev/null
+        ip addr show "$IFACE" 2>/dev/null
+        ping -c 2 -W 3 "$HOST_IP" 2>&1
+        log "ping host rc=$?"
         break
     fi
 done
 
-if [ "${NET_OK}" = "0" ]; then
-    log "ERROR: no network interface found — relay machines cannot connect"
-fi
-
-# Create socket directory
 mkdir -p /tmp/perfetto-sockets
 
-# Start central traced with relay endpoint on TCP
-log "=== Starting central traced on 0.0.0.0:${LISTEN_PORT} ==="
-PERFETTO_PRODUCER_SOCK_NAME=/tmp/perfetto-sockets/perfetto-producer,0.0.0.0:${LISTEN_PORT} \
-PERFETTO_CONSUMER_SOCK_NAME=/tmp/perfetto-sockets/perfetto-consumer \
+# Start central traced
+log "=== Starting traced on 0.0.0.0:${LISTEN_PORT} ==="
+PERFETTO_PRODUCER_SOCK_NAME=${PRODUCER_SOCK},0.0.0.0:${LISTEN_PORT} \
+PERFETTO_CONSUMER_SOCK_NAME=${CONSUMER_SOCK} \
 traced --enable-relay-endpoint &
 TRACED_PID=$!
 sleep 3
 
-if kill -0 "${TRACED_PID}" 2>/dev/null; then
-    log "TRACED_ALIVE pid=${TRACED_PID} listening on TCP:${LISTEN_PORT}"
+if kill -0 "$TRACED_PID" 2>/dev/null; then
+    log "TRACED_ALIVE pid=$TRACED_PID"
 else
-    log "TRACED_DIED — check binary and libperfetto.so"
-    PERFETTO_PRODUCER_SOCK_NAME=/tmp/perfetto-sockets/perfetto-producer,0.0.0.0:${LISTEN_PORT} \
-    PERFETTO_CONSUMER_SOCK_NAME=/tmp/perfetto-sockets/perfetto-consumer \
-    traced --enable-relay-endpoint 2>&1 &
-    TRACED_PID=$!
-    sleep 5
+    log "TRACED_DIED"
 fi
 
-# Start local traced_probes (for Linux ftrace + process_stats)
-log "=== Starting local traced_probes ==="
-PERFETTO_PRODUCER_SOCK_NAME=/tmp/perfetto-sockets/perfetto-producer \
+# Start probes
+log "=== Starting traced_probes ==="
+PERFETTO_PRODUCER_SOCK_NAME=${PRODUCER_SOCK} \
 traced_probes &
 PROBES_PID=$!
 sleep 2
-
-if kill -0 "${PROBES_PID}" 2>/dev/null; then
-    log "PROBES_ALIVE pid=${PROBES_PID}"
+if kill -0 "$PROBES_PID" 2>/dev/null; then
+    log "PROBES_ALIVE pid=$PROBES_PID"
 else
     log "PROBES_DIED"
 fi
 
-# Copy bundled trace config
-if [ -f /etc/linux-central-3vm.pbtxt ]; then
-    cp /etc/linux-central-3vm.pbtxt /data/
-    log "Trace config: /data/linux-central-3vm.pbtxt"
-fi
-
+# Config
+cp /etc/multivm-3vm.pbtxt /data/ 2>/dev/null
 log "=== Central traced ready ==="
-log "Waiting ${SETTLE_TIME}s for QNX relay machines to connect..."
+log "Waiting ${SETTLE_TIME}s for relay machines..."
+sleep "$SETTLE_TIME"
 
-# Wait for relay machines to connect
-sleep "${SETTLE_TIME}"
+# Auto-capture
+TRACE_OUT=/data/trace.pftrace
+log "=== Starting 30s trace capture ==="
+PERFETTO_CONSUMER_SOCK_NAME=${CONSUMER_SOCK} \
+perfetto --txt -c /data/multivm-3vm.pbtxt -o "$TRACE_OUT" 2>&1
+RC=$?
 
-# Auto-capture trace
-TRACE_OUT="/data/trace.pftrace"
-log "=== Starting ${TRACE_DURATION}s trace capture ==="
-PERFETTO_CONSUMER_SOCK_NAME=/tmp/perfetto-sockets/perfetto-consumer \
-perfetto --txt -c /data/linux-central-3vm.pbtxt -o "${TRACE_OUT}" 2>&1
-CAPTURE_RC=$?
-
-if [ ${CAPTURE_RC} -eq 0 ] && [ -f "${TRACE_OUT}" ]; then
-    TRACE_SIZE=$(busybox ls -lh "${TRACE_OUT}" | busybox awk '{print $5}')
-    log "CAPTURE_OK size=${TRACE_SIZE} file=${TRACE_OUT}"
-
-    # Serve trace via netcat for download
-    # From QNX host: nc 10.10.10.3 9999 > trace.pftrace
-    log "Serving trace on TCP:9999 — download with: nc ${GUEST_IP} 9999 > trace.pftrace"
+NC_PID=""
+if [ $RC -eq 0 ] && [ -f "$TRACE_OUT" ]; then
+    TRACE_SIZE=$(ls -lh "$TRACE_OUT" | awk '{print $5}')
+    log "CAPTURE_OK size=$TRACE_SIZE"
+    log "Serving on TCP:9999"
     while true; do
-        busybox nc -l -p 9999 < "${TRACE_OUT}" 2>/dev/null
-        log "nc: connection served, re-listening..."
+        nc -l -p 9999 < "$TRACE_OUT" 2>/dev/null
     done &
     NC_PID=$!
 else
-    log "CAPTURE_FAILED rc=${CAPTURE_RC}"
+    log "CAPTURE_FAILED rc=$RC"
 fi
 
-log "=== Trace capture complete ==="
-log "Keeping guest alive for file retrieval (300s)..."
-
-# Keep alive for trace download
+log "=== Keeping alive 300s ==="
 sleep 300
-
-log "=== Shutting down ==="
-kill ${NC_PID} ${PROBES_PID} ${TRACED_PID} 2>/dev/null
-sync
+kill $NC_PID $PROBES_PID $TRACED_PID 2>/dev/null

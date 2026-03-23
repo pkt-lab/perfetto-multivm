@@ -23,7 +23,7 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BASE_INITRD="${BASE_INITRD:-/tmp/initrd-v12.gz}"
 PERFETTO_OUT="${PERFETTO_OUT:-/tmp/linux-bins-stripped}"
-TRACE_CONFIG="${TRACE_CONFIG:-${SCRIPT_DIR}/../configs/linux-central-3vm.pbtxt}"
+TRACE_CONFIG="${TRACE_CONFIG:-${SCRIPT_DIR}/../configs/multivm-3vm.pbtxt}"
 LIBSTDCXX="${LIBSTDCXX:-}"
 WORK=/tmp/initrd-central-work
 OUT=/tmp/initrd-linux-central.gz
@@ -36,7 +36,6 @@ OUT=/tmp/initrd-linux-central.gz
 # Find libstdc++ if not specified
 if [ -z "$LIBSTDCXX" ]; then
     for candidate in \
-        /tmp/repack-test/lib/libstdc++.so.6 \
         /usr/lib/aarch64-linux-gnu/libstdc++.so.6; do
         if [ -f "$candidate" ]; then
             LIBSTDCXX="$candidate"
@@ -93,7 +92,7 @@ echo "" > etc/fstab 2>/dev/null || true
 # Bundle trace config
 mkdir -p etc
 if [ -f "$TRACE_CONFIG" ]; then
-    cp "$TRACE_CONFIG" etc/linux-central-3vm.pbtxt
+    cp "$TRACE_CONFIG" etc/multivm-3vm.pbtxt
     echo "  Bundled trace config"
 fi
 

@@ -27,7 +27,6 @@ static int         g_dest_port = 20001;
 
 struct proxy_pair {
     int client_fd;
-    int upstream_fd;
 };
 
 /* Shovel bytes from src to dst until EOF or error */
