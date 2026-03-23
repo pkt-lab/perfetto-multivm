@@ -1,0 +1,59 @@
+# Perfetto 3-VM trace config: Linux guest as CENTRAL traced
+#
+# Topology:
+#   Linux guest (10.10.10.3) — central traced + traced_probes + perfetto CLI
+#   QNX host   (10.10.10.1) — traced_relay → host TCP proxy → Linux guest
+#   QNX guest  (10.10.10.2) — traced_relay → host TCP proxy → Linux guest
+#
+# Run from Linux guest:
+#   perfetto --txt -c /tmp/linux-central-3vm.pbtxt -o /tmp/trace.pftrace
+
+duration_ms: 30000
+write_into_file: true
+file_write_period_ms: 5000
+flush_period_ms: 5000
+trace_all_machines: true
+
+# Buffer 0: QNX kernel events (host + guest, from relay producers)
+buffers {
+  size_kb: 131072
+}
+
+# Buffer 1: Linux ftrace + process stats (local producers)
+buffers {
+  size_kb: 65536
+}
+
+# QNX kernel data source → buffer 0
+data_sources {
+  config {
+    name: "qnx.kernel"
+    target_buffer: 0
+  }
+}
+
+# Linux ftrace → buffer 1
+data_sources {
+  config {
+    name: "linux.ftrace"
+    target_buffer: 1
+    ftrace_config {
+      ftrace_events: "sched/sched_switch"
+      ftrace_events: "sched/sched_wakeup"
+      ftrace_events: "sched/sched_process_fork"
+      ftrace_events: "sched/sched_process_exit"
+      ftrace_events: "sched/sched_process_free"
+    }
+  }
+}
+
+# Linux process stats → buffer 1 (CRITICAL for thread-process association)
+data_sources {
+  config {
+    name: "linux.process_stats"
+    target_buffer: 1
+    process_stats_config {
+      scan_all_processes_on_start: true
+    }
+  }
+}
